@@ -5,7 +5,30 @@ upstream `moonlight-common-c` and the OpenOrbis toolchain, with the video decode
 abstract interface: FFmpeg software decode to validate the full stack, and `libSceVideodec2`
 hardware decode as the stretch goal.
 
-**Current version: 1.1.0** (as of 2026-08-11).
+**Current version: 1.3.13** (as of 2026-11-07).
+
+## Next steps (agreed 2026-11-06)
+
+Develop for the PS4 Pro's performance first; Slim and Fat support is not a goal for this work.
+
+Work in this order:
+
+1. **Rumble and reliability, shipped in the same update:** implement rumble (the app advertises it
+   to the host but does not implement it yet), reconnect automatically after a dropped stream, and
+   find the memory leak with the 1.3.4 measurements. Gyroscope, accelerometer, touchpad touches and
+   light bar ship with them. Before a public release, also fix the controller lost after the host wakes.
+2. **HEVC, dropped:** probed on a PS4 Pro (FW 9.00). `sceVideodec2QueryHevcDecoderMemoryInfo` resolves,
+   but accepts only codec 1 with H.264 profiles and levels, and refuses codecs 0 and 2 to 255;
+   `libSceSystemServiceActivateHevc.sprx` does not load. The stream stays H.264.
+3. **In-stream menu:** done, on OPTIONS + touchpad: stats, frame pacing, bitrate, disconnect, quit game.
+
+Per-game settings were dropped: the in-stream menu already changes bitrate and pacing, and one set of
+settings suits most games on the Pro. Rumble strength was dropped too: many games have their own setting.
+
+Before the public release: redesign the whole interface.
+
+Later: real 4K output, direct YCbCr output, HDR, USB keyboard and mouse, French UI, favourites,
+direct launch after Wake PC, and public release work (install guide, CI builds, license review).
 
 ## Realistic goal
 

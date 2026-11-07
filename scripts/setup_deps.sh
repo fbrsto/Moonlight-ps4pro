@@ -93,6 +93,9 @@ while read -r name path url pin; do
     checkout_pin "$name" "$path" "$url" "$pin"
 done < <(grep -v '^[[:space:]]*#' "$DEPS_FILE" | grep -v '^[[:space:]]*$')
 
+# mbedTLS 3.6 configures from its own framework submodule.
+git -C "$REPO_DIR/third_party/mbedtls" submodule update --init --recursive
+
 # Sync parent-index gitlinks when this tree is a git checkout (optional).
 if git -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     git -C "$REPO_DIR" submodule sync --recursive >/dev/null 2>&1 || true

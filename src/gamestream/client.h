@@ -7,6 +7,7 @@
 #include <Limelight.h>
 
 #include "certgen.h"
+#include "gs_http.h"
 #include "mini_xml.h"
 
 #define GS_UNIQUEID "0123456789ABCDEF"
@@ -24,6 +25,8 @@ typedef struct {
     int serverCodecModeSupport;
     bool isNvidiaSoftware;
 
+    char hostname[64]; // PC name from serverinfo; empty if not reported
+    char mac[18];      // for Wake-on-LAN; empty until the host reports a real one
     char appVersion[32];
     char gfeVersion[32];
     char serverCertPem[8192]; // server certificate saved during pairing
@@ -42,6 +45,9 @@ int gs_pair(gs_server_t *server, const char *pin);
 int gs_unpair(gs_server_t *server);
 
 int gs_applist(gs_server_t *server, app_entry_t **list);
+
+// Fetch an app's box art image; the caller frees resp with http_resp_free.
+int gs_app_asset(gs_server_t *server, int appId, http_resp_t *resp);
 
 // Launch or resume an app and leave the server ready for LiStartConnection.
 // Fills config->remoteInputAesKey/Iv and server->rtspSessionUrl.

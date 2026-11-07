@@ -5,6 +5,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include "../ui/stream_menu.h"
+
 #ifndef ML_ENABLE_VIDEODEC2
 #define ML_ENABLE_VIDEODEC2 0
 #endif
@@ -82,6 +84,18 @@ int video_present_is_bgra(void);
  * drawn top-left on the streamed frame. Only supported in BGRA present mode
  * (prefer_ycbcr=false); ignored otherwise. */
 void video_set_show_stats(int enable);
+/* enable = 0 flips without waiting for vblank: less latency, may tear. */
+void video_set_vsync(int enable);
+void video_set_frame_pacing(int fps); /* 0 = off */
+/* Draws this menu over every presented frame; NULL hides it. It must stay valid while shown. */
+void video_set_stream_menu(const stream_menu_t *menu);
+void video_take_flip_wait_stats(unsigned *count, unsigned *total_us);
+/* Frames allowed to wait for a flip (1..2); each one is a frame of latency. */
+void video_set_flip_queue_max(int frames);
+/* Flips waiting when each frame was ready, since the last call. */
+void video_take_flip_queue_stats(unsigned *avg_x100, unsigned *max);
+/* "POOR CONNECTION" notice drawn on the streamed frame (BGRA present mode only). */
+void video_set_conn_warning(int enable);
 /* BGRA pipeline: kick convert async; finish = join + flip. Decode always separate. */
 int video_present_bgra_pipe_kick(const uint8_t *y, const uint8_t *uv,
                                  int pitch_y, int pitch_uv, int w, int h);

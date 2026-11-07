@@ -23,7 +23,34 @@
 #define CONFIG_DIR "."
 #endif
 
-#define VERSION_STR "1.1.0"
+#define VERSION_STR "1.3.13"
+
+#ifdef __ORBIS__
+#include <pthread.h>
+#include <stdint.h>
+
+#define GNM_HEARTBEAT_US 16000
+extern int32_t sceGnmSubmitDone(void);
+
+/*
+ * The system expects GPU clients to call sceGnmSubmitDone regularly, and faults
+ * apps that stop doing so around suspend or close (SUBMITDONE_TIMEOUT). The call
+ * can wait while the system suspends the app, hence a thread of its own.
+ */
+static void *gnm_heartbeat_main(void *arg) {
+    (void)arg;
+    int logged = 0;
+    for (;;) {
+        int32_t rc = sceGnmSubmitDone();
+        if (rc != 0 && !logged) {
+            LOGW("gnm: sceGnmSubmitDone => 0x%08x", (unsigned)rc);
+            logged = 1;
+        }
+        sceKernelUsleep(GNM_HEARTBEAT_US);
+    }
+    return NULL;
+}
+#endif
 
 static void read_line_file(const char *path, char *out, size_t outlen) {
     out[0] = '\0';
@@ -94,20 +121,15 @@ int main(void) {
          VERSION_STR, cfg.host, cfg.debug_host,
          cfg.stream.width, cfg.stream.height, cfg.stream.fps, cfg.stream.bitrate);
 
-    if (cfg.prefer_ycbcr)
-        LOGN("YCbCr active");
-
     /* No host: don't hang. The menu lets the user type it in Settings. */
 
 #ifdef __ORBIS__
-    if (cfg.prefer_ycbcr && !video_present_plugin_loaded()) {
-        LOGW("ycbcr_unlock.loaded MISSING — YCbCr will fail without GoldHEN plugin");
-    } else if (cfg.prefer_ycbcr) {
-        LOGI("ycbcr_unlock plugin: marker OK (%s)", ML_YCBCR_PLUGIN_MARKER);
-    }
-
     /* Before any present init: the menu already brings up the BGRA path. */
     video_present_set_bgra_tuning(cfg.bgra_workers, cfg.bgra_nt);
+
+    pthread_t gnm_thread;
+    if (pthread_create(&gnm_thread, NULL, gnm_heartbeat_main, NULL) != 0)
+        LOGW("gnm: heartbeat thread not started");
 
     if (cfg.videodec2_spike) {
         int spike_rc = videodec2_spike_run();

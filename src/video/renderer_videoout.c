@@ -1,9 +1,12 @@
 // sceVideoOut presentation: YCbCr420_BT709 / NV12 (BGRA only if prefer_ycbcr=0).
 #include "video.h"
+#include "frame_pacer.h"
+#include "nv12_bgra.h"
 #include "nv12_blit.h"
 #include "../log.h"
 #include "../orbis/video_out_c.h"
 #include "../ui/ui_draw.h"
+#include "../ui/stream_menu.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -41,6 +44,16 @@ static int s_gray_left;  /* gray test frames at start */
 static int s_last_flip_idx = -1;
 static int s_flip_wait_logs;
 static int s_show_stats;
+static int s_stats_refresh_reset; /* a new stream must not show the last one's numbers */
+static int s_vsync = 1;
+static frame_pacer_t s_pacer;
+static const stream_menu_t *volatile s_stream_menu;
+static int s_flip_queue_max = 1;
+static unsigned s_pending_sum, s_pending_samples, s_pending_max;
+#define FLIP_SLOT_WAIT_MAX_US 6000
+#define FLIP_SLOT_POLL_US 500
+static unsigned s_flip_slot_waits, s_flip_slot_wait_us;
+static volatile int s_conn_warning; /* written from the connection status callback */
 
 /*
  * BGRA MT: workers claim row bands off an atomic counter, so a slow band does
@@ -88,6 +101,19 @@ static int s_bgra_nt;         /* resolved: 1 = streaming stores */
 static int s_pipe_active;
 static int s_pipe_fb_idx = -1;
 
+/*
+ * A converted frame is flipped as soon as its convert ends, not when the next
+ * frame arrives. s_pipe_mtx guards the pipe and flip state, which the decoder
+ * thread and the flip thread share; take it before s_bgra_mtx, never after.
+ * s_flip_pending and s_flip_shutdown are guarded by s_bgra_mtx.
+ */
+static pthread_mutex_t s_pipe_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t s_flip_thr;
+static int s_flip_thr_alive;
+static int s_flip_pending;
+static int s_flip_shutdown;
+
+static void *flip_thread_main(void *arg);
 static void bgra_worker_start(void);
 static void bgra_worker_stop(void);
 static void bgra_resolve_store_mode(void);
@@ -401,12 +427,6 @@ static int switch_to_bgra(int w, int h) {
     return 0;
 }
 
-static inline uint8_t clamp_u8(int v) {
-    if (v < 0) return 0;
-    if (v > 255) return 255;
-    return (uint8_t)v;
-}
-
 static void yuv_to_bgra(uint8_t *dst, int dst_pitch, int w, int h,
                         const uint8_t *y, const uint8_t *u, const uint8_t *v,
                         int pitch_y, int pitch_u, int pitch_v) {
@@ -416,17 +436,8 @@ static void yuv_to_bgra(uint8_t *dst, int dst_pitch, int w, int h,
         const uint8_t *urow = u + (size_t)(row / 2) * (size_t)pitch_u;
         const uint8_t *vrow = v + (size_t)(row / 2) * (size_t)pitch_v;
         for (int x = 0; x < w; x++) {
-            int yy = yrow[x];
-            int uu = (int)urow[x / 2] - 128;
-            int vv = (int)vrow[x / 2] - 128;
-            /* >>7 + coeffs ≤227: fit in int16 (avoids mullo 359/454 overflow). */
-            int r = yy + ((179 * vv) >> 7);
-            int g = yy - ((44 * uu + 92 * vv) >> 7);
-            int b = yy + ((227 * uu) >> 7);
-            drow[x * 4 + 0] = clamp_u8(b);
-            drow[x * 4 + 1] = clamp_u8(g);
-            drow[x * 4 + 2] = clamp_u8(r);
-            drow[x * 4 + 3] = 0xFF;
+            nv12_to_bgra_px(drow + (size_t)x * 4, yrow[x],
+                            (int)urow[x / 2] - 128, (int)vrow[x / 2] - 128);
         }
     }
 }
@@ -481,140 +492,8 @@ static void yuv_to_bgra_scaled(uint8_t *dst, int dst_pitch, int dst_w, int dst_h
         const uint8_t *vrow = v + (size_t)uv_row * (size_t)pitch_v;
         for (int x = 0; x < dst_w; x++) {
             int sx = x_lut[x];
-            int yy = yrow[sx];
-            int uu = (int)urow[sx / 2] - 128;
-            int vv = (int)vrow[sx / 2] - 128;
-            int r = yy + ((179 * vv) >> 7);
-            int g = yy - ((44 * uu + 92 * vv) >> 7);
-            int b = yy + ((227 * uu) >> 7);
-            drow[x * 4 + 0] = clamp_u8(b);
-            drow[x * 4 + 1] = clamp_u8(g);
-            drow[x * 4 + 2] = clamp_u8(r);
-            drow[x * 4 + 3] = 0xFF;
-        }
-    }
-}
-
-/*
- * Store mode for the BGRA output. Non-temporal only pays off on WC_GARLIC:
- * on the ONION/WB alias the cache is what hides the coherent bus latency, and
- * bypassing it measured ~6x slower (8.3 ms vs 1.4 ms per 1080p frame).
- */
-#define BGRA_ST_UNALIGNED 0
-#define BGRA_ST_ALIGNED   1
-#define BGRA_ST_NT        2
-
-/* 8 px BGRA from Y (epi16) + precomputed chroma terms. */
-static inline __attribute__((always_inline)) void
-bgra_store8(uint8_t *dp, __m128i y16, __m128i rv, __m128i guv, __m128i bu,
-            __m128i a255, const int st_mode) {
-    __m128i r = _mm_add_epi16(y16, rv);
-    __m128i g = _mm_sub_epi16(y16, guv);
-    __m128i b = _mm_add_epi16(y16, bu);
-    __m128i br = _mm_packus_epi16(b, r);
-    __m128i ga = _mm_packus_epi16(g, a255);
-    __m128i bg0 = _mm_unpacklo_epi8(br, ga);
-    __m128i ra0 = _mm_unpackhi_epi8(br, ga);
-    __m128i px0 = _mm_unpacklo_epi16(bg0, ra0);
-    __m128i px1 = _mm_unpackhi_epi16(bg0, ra0);
-    if (st_mode == BGRA_ST_NT) {
-        /* Callers pair +0/+32 so full 64B lines are written. */
-        _mm_stream_si128((__m128i *)(void *)dp, px0);
-        _mm_stream_si128((__m128i *)(void *)(dp + 16), px1);
-    } else if (st_mode == BGRA_ST_ALIGNED) {
-        _mm_store_si128((__m128i *)(void *)dp, px0);
-        _mm_store_si128((__m128i *)(void *)(dp + 16), px1);
-    } else {
-        _mm_storeu_si128((__m128i *)(void *)dp, px0);
-        _mm_storeu_si128((__m128i *)(void *)(dp + 16), px1);
-    }
-}
-
-static inline void nv12_to_bgra_px(uint8_t *dp, int yy, int uu, int vv) {
-    dp[0] = clamp_u8(yy + ((227 * uu) >> 7));
-    dp[1] = clamp_u8(yy - ((44 * uu + 92 * vv) >> 7));
-    dp[2] = clamp_u8(yy + ((179 * vv) >> 7));
-    dp[3] = 0xFF;
-}
-
-/*
- * 16 px/iter, 2 Y rows per UV row (4:2:0: chroma computed once per pair),
- * prefetch next row pair (Jaguar). Constant `st_mode` → compiler emits
- * a single store variant per instantiation.
- *
- * Coefs >>7 (179/44/92/227): ≈ BT.601 JPEG and |chroma|·coeff ≤ 28829 < 32768
- * → mullo_epi16 without wrap (>>8 path with 359/454 painted lilac as #ffc400).
- */
-static inline __attribute__((always_inline)) void
-nv12_to_bgra_impl(uint8_t *dst, int dst_pitch, int w, int h,
-                  const uint8_t *y, const uint8_t *uv,
-                  int pitch_y, int pitch_uv, const int st_mode) {
-    const __m128i zero = _mm_setzero_si128();
-    const __m128i m00ff = _mm_set1_epi16(0x00FF);
-    const __m128i c128 = _mm_set1_epi16(128);
-    const __m128i c179 = _mm_set1_epi16(179);
-    const __m128i c44 = _mm_set1_epi16(44);
-    const __m128i c92 = _mm_set1_epi16(92);
-    const __m128i c227 = _mm_set1_epi16(227);
-    const __m128i a255 = _mm_set1_epi16(255);
-
-    int row = 0;
-    for (; row + 1 < h; row += 2) {
-        uint8_t *drow0 = dst + (size_t)row * (size_t)dst_pitch;
-        uint8_t *drow1 = drow0 + dst_pitch;
-        const uint8_t *yrow0 = y + (size_t)row * (size_t)pitch_y;
-        const uint8_t *yrow1 = yrow0 + pitch_y;
-        const uint8_t *uvrow = uv + (size_t)(row / 2) * (size_t)pitch_uv;
-        int x = 0;
-        for (; x + 15 < w; x += 16) {
-            _mm_prefetch((const char *)(yrow1 + pitch_y + x), _MM_HINT_T0);
-            _mm_prefetch((const char *)(yrow1 + 2 * pitch_y + x), _MM_HINT_T0);
-            _mm_prefetch((const char *)(uvrow + pitch_uv + x), _MM_HINT_T0);
-
-            /* 16B interleaved UV = chroma for 16 px; deinterleave by mask/shift */
-            __m128i uv8 = _mm_loadu_si128((const __m128i *)(const void *)(uvrow + x));
-            __m128i u16 = _mm_sub_epi16(_mm_and_si128(uv8, m00ff), c128);
-            __m128i v16 = _mm_sub_epi16(_mm_srli_epi16(uv8, 8), c128);
-            __m128i rv = _mm_srai_epi16(_mm_mullo_epi16(v16, c179), 7);
-            __m128i guv = _mm_srai_epi16(
-                _mm_add_epi16(_mm_mullo_epi16(u16, c44),
-                              _mm_mullo_epi16(v16, c92)), 7);
-            __m128i bu = _mm_srai_epi16(_mm_mullo_epi16(u16, c227), 7);
-            /* duplicate each chroma sample to its 2 px */
-            __m128i rv_lo = _mm_unpacklo_epi16(rv, rv);
-            __m128i rv_hi = _mm_unpackhi_epi16(rv, rv);
-            __m128i guv_lo = _mm_unpacklo_epi16(guv, guv);
-            __m128i guv_hi = _mm_unpackhi_epi16(guv, guv);
-            __m128i bu_lo = _mm_unpacklo_epi16(bu, bu);
-            __m128i bu_hi = _mm_unpackhi_epi16(bu, bu);
-
-            __m128i y0 = _mm_loadu_si128((const __m128i *)(const void *)(yrow0 + x));
-            __m128i y1 = _mm_loadu_si128((const __m128i *)(const void *)(yrow1 + x));
-            bgra_store8(drow0 + (size_t)x * 4,
-                        _mm_unpacklo_epi8(y0, zero), rv_lo, guv_lo, bu_lo, a255, st_mode);
-            bgra_store8(drow0 + (size_t)x * 4 + 32,
-                        _mm_unpackhi_epi8(y0, zero), rv_hi, guv_hi, bu_hi, a255, st_mode);
-            bgra_store8(drow1 + (size_t)x * 4,
-                        _mm_unpacklo_epi8(y1, zero), rv_lo, guv_lo, bu_lo, a255, st_mode);
-            bgra_store8(drow1 + (size_t)x * 4 + 32,
-                        _mm_unpackhi_epi8(y1, zero), rv_hi, guv_hi, bu_hi, a255, st_mode);
-        }
-        for (; x < w; x++) {
-            int uu = (int)uvrow[(x / 2) * 2] - 128;
-            int vv = (int)uvrow[(x / 2) * 2 + 1] - 128;
-            nv12_to_bgra_px(drow0 + (size_t)x * 4, yrow0[x], uu, vv);
-            nv12_to_bgra_px(drow1 + (size_t)x * 4, yrow1[x], uu, vv);
-        }
-    }
-    /* fila suelta si h impar */
-    for (; row < h; row++) {
-        uint8_t *drow = dst + (size_t)row * (size_t)dst_pitch;
-        const uint8_t *yrow = y + (size_t)row * (size_t)pitch_y;
-        const uint8_t *uvrow = uv + (size_t)(row / 2) * (size_t)pitch_uv;
-        for (int x = 0; x < w; x++) {
-            int uu = (int)uvrow[(x / 2) * 2] - 128;
-            int vv = (int)uvrow[(x / 2) * 2 + 1] - 128;
-            nv12_to_bgra_px(drow + (size_t)x * 4, yrow[x], uu, vv);
+            nv12_to_bgra_px(drow + (size_t)x * 4, yrow[sx],
+                            (int)urow[sx / 2] - 128, (int)vrow[sx / 2] - 128);
         }
     }
 }
@@ -757,6 +636,12 @@ static void bgra_worker_start(void) {
     }
     if (ok == want) {
         s_bgra_worker_alive = 1;
+        s_flip_pending = 0;
+        s_flip_shutdown = 0;
+        /* Without this thread frames still flip, when the next one arrives. */
+        s_flip_thr_alive = pthread_create(&s_flip_thr, NULL, flip_thread_main, NULL) == 0;
+        if (!s_flip_thr_alive)
+            LOGW("present: flip thread create failed");
     } else {
         s_bgra_shutdown = 1;
         pthread_cond_broadcast(&s_bgra_cv);
@@ -771,6 +656,15 @@ static void bgra_worker_start(void) {
 static void bgra_worker_stop(void) {
     if (!s_bgra_worker_alive)
         return;
+    /* First: it may be waiting on a convert only the workers can finish. */
+    if (s_flip_thr_alive) {
+        pthread_mutex_lock(&s_bgra_mtx);
+        s_flip_shutdown = 1;
+        pthread_cond_broadcast(&s_bgra_cv);
+        pthread_mutex_unlock(&s_bgra_mtx);
+        pthread_join(s_flip_thr, NULL);
+        s_flip_thr_alive = 0;
+    }
     pthread_mutex_lock(&s_bgra_mtx);
     s_bgra_shutdown = 1;
     pthread_cond_broadcast(&s_bgra_cv);
@@ -1082,11 +976,13 @@ void video_present_shutdown(void) {
      * Close hangs with pending flips; menu/stream reuse the same port.
      */
     LOGI("present: soft-shutdown (without Close)");
+    pthread_mutex_lock(&s_pipe_mtx);
     if (s_pipe_active) {
         bgra_convert_wait();
         s_pipe_active = 0;
         s_pipe_fb_idx = -1;
     }
+    pthread_mutex_unlock(&s_pipe_mtx);
     bgra_worker_stop();
     nv12_blit_shutdown();
     s_flip_logged = 0;
@@ -1125,6 +1021,39 @@ static int pick_free_fb(int *out_shown) {
 
 void video_set_show_stats(int enable) {
     s_show_stats = enable ? 1 : 0;
+    s_stats_refresh_reset = 1;
+}
+
+void video_set_vsync(int enable) {
+    s_vsync = enable ? 1 : 0;
+}
+
+void video_set_stream_menu(const stream_menu_t *menu) {
+    s_stream_menu = menu;
+}
+
+void video_set_frame_pacing(int fps) {
+    frame_pacer_set(&s_pacer, fps);
+}
+
+void video_set_flip_queue_max(int frames) {
+    s_flip_queue_max = frames < 1 ? 1 : (frames > 2 ? 2 : frames);
+}
+
+void video_take_flip_queue_stats(unsigned *avg_x100, unsigned *max) {
+    *avg_x100 = s_pending_samples ? s_pending_sum * 100u / s_pending_samples : 0;
+    *max = s_pending_max;
+    s_pending_sum = s_pending_samples = s_pending_max = 0;
+}
+
+void video_take_flip_wait_stats(unsigned *count, unsigned *total_us) {
+    *count = s_flip_slot_waits;
+    *total_us = s_flip_slot_wait_us;
+    s_flip_slot_waits = s_flip_slot_wait_us = 0;
+}
+
+void video_set_conn_warning(int enable) {
+    s_conn_warning = enable ? 1 : 0;
 }
 
 /* Colors 0xAARRGGBB (BGRA LE); the output plane ignores alpha (see ui_menu.c). */
@@ -1141,15 +1070,46 @@ void video_set_show_stats(int enable) {
  * timeline (bar per recent frame; green/amber/red vs. 60/30 fps budgets).
  * Draws directly onto the BGRA backbuffer before it is flushed/flipped, so
  * it is redrawn fresh every frame (no need to erase it beforehand). */
+#define STATS_REFRESH_US 500000ull
+static video_live_stats_t s_stats_shown;
+static uint64_t s_stats_shown_us;
+
+/* The display reads memory directly, past the CPU cache: small regions written
+ * just before a flip can otherwise reach the screen a frame late. */
+static void flush_fb_rect(uint8_t *dst, int x, int y, int w, int h) {
+    enum { CACHE_LINE = 64 };
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > s_width) w = s_width - x;
+    if (y + h > s_buf_h) h = s_buf_h - y;
+    if (w <= 0 || h <= 0)
+        return;
+    for (int r = 0; r < h; r++) {
+        uint8_t *row = dst + (size_t)(y + r) * (size_t)s_pitch + (size_t)x * 4u;
+        uintptr_t p = (uintptr_t)row & ~(uintptr_t)(CACHE_LINE - 1);
+        uintptr_t end = (uintptr_t)row + (size_t)w * 4u;
+        for (; p < end; p += CACHE_LINE)
+            _mm_clflush((const void *)p);
+    }
+    _mm_mfence();
+}
+
 static void draw_stats_overlay(uint8_t *dst) {
-    video_live_stats_t live;
-    video_stats_get_live(&live);
+    /* Numbers repainted 60 times a second just flicker: refresh them slowly. */
+    uint64_t now = now_us();
+    if (s_stats_refresh_reset || now - s_stats_shown_us >= STATS_REFRESH_US) {
+        video_stats_get_live(&s_stats_shown);
+        s_stats_shown_us = now;
+        s_stats_refresh_reset = 0;
+    }
+    const video_live_stats_t live = s_stats_shown;
 
     ui_surface_t s = { dst, s_pitch, s_width, s_buf_h };
 
     const int scale = 2;
     const int line_h = 8 * scale + 6;
-    const int graph_w = 240, graph_h = 56;
+    /* As wide as the longest line: "PRES 100.0ms  TOT 100.0ms", 25 characters. */
+    const int graph_w = 25 * 8 * scale, graph_h = 56;
     const int px = 24, py = 24;
     const int pad = 12;
     const int pw = graph_w + pad * 2;
@@ -1207,17 +1167,50 @@ static void draw_stats_overlay(uint8_t *dst) {
             col = STATS_COL_WARN; /* below 60fps budget */
         ui_rect(&s, x0 + i * (bar_w + gap), gy + graph_h - h, bar_w, h, col);
     }
+
+    flush_fb_rect(dst, px, py, pw, ph);
+}
+
+static void draw_conn_warning(uint8_t *dst) {
+    static const char k_text[] = "POOR CONNECTION";
+    ui_surface_t s = { dst, s_pitch, s_width, s_buf_h };
+    const int scale = 3, pad = 14;
+    int tw = ui_text_w(scale, k_text);
+    int pw = tw + pad * 2, ph = 8 * scale + pad * 2;
+    int px = s_width - pw - 24, py = 24;
+    ui_rect(&s, px, py, pw, ph, STATS_COL_BG);
+    ui_rect(&s, px, py, pw, 3, STATS_COL_BAD);
+    ui_text(&s, px + pad, py + pad, scale, STATS_COL_WARN, k_text);
+    flush_fb_rect(dst, px, py, pw, ph);
 }
 
 static void present_submit_flip(int next, uint8_t *dst, uint64_t convert_us) {
     if (s_show_stats && s_use_bgra)
         draw_stats_overlay(dst);
+    if (s_conn_warning && s_use_bgra)
+        draw_conn_warning(dst);
+    const stream_menu_t *menu = s_stream_menu;
+    if (menu && s_use_bgra) {
+        ui_surface_t surface = { dst, s_pitch, s_width, s_buf_h };
+        int mx, my, mw, mh;
+        stream_menu_draw(&surface, menu);
+        stream_menu_bounds(&mx, &my, &mw, &mh);
+        flush_fb_rect(dst, mx, my, mw, mh);
+    }
 
     __asm__ volatile("sfence" ::: "memory");
     sceGnmFlushGarlic();
 
+    uint64_t pace_wait = frame_pacer_next_wait(&s_pacer, now_us());
+    if (pace_wait)
+        sceKernelUsleep((unsigned)pace_wait);
+
     uint64_t t1 = now_us();
-    int32_t flip_rc = sceVideoOutSubmitFlip(s_video, next, (uint32_t)s_flip_mode, 0);
+    /* V-Sync off uses the same immediate flip mode as the menu (2 = HSYNC). */
+    uint32_t mode = s_vsync ? (uint32_t)s_flip_mode : 2u;
+    int32_t flip_rc = sceVideoOutSubmitFlip(s_video, next, mode, 0);
+    if (flip_rc != 0 && mode != (uint32_t)s_flip_mode)
+        flip_rc = sceVideoOutSubmitFlip(s_video, next, (uint32_t)s_flip_mode, 0);
     s_fb_index = next;
     s_last_flip_idx = next;
 
@@ -1259,6 +1252,14 @@ int video_present_should_drop(void) {
     MlVideoOutFlipStatus st;
     if (sceVideoOutGetFlipStatus(s_video, &st) != 0)
         return 0;
+    s_pending_sum += (unsigned)st.numFlipPending;
+    s_pending_samples++;
+    if ((unsigned)st.numFlipPending > s_pending_max)
+        s_pending_max = (unsigned)st.numFlipPending;
+    /* Each queued flip is a frame of display latency. The stream runs a touch
+     * faster than a 59.94 Hz display, so an unbounded queue fills and stays full. */
+    if (s_use_bgra && st.numFlipPending >= s_flip_queue_max)
+        return 1;
     /* Active pipe occupies 1 FB in convert; counts as extra busy. */
     int busy = st.numFlipPending + (s_pipe_active ? 1 : 0);
     if (s_fb_count > 1)
@@ -1281,32 +1282,91 @@ int video_present_flip_backlogged(void) {
     return st.numFlipPending >= 1 ? 1 : 0;
 }
 
-int video_present_bgra_pipe_finish(void) {
+/*
+ * The stream and the display run at nearly the same rate, so frame arrival drifts
+ * slowly across the vblank. While it sits just before the vblank, the previous flip
+ * is still pending when the next frame lands: dropping that frame halves the frame
+ * rate for as long as the drift lasts. The flip latches within milliseconds, so wait
+ * for it. A longer wait means a real backlog, and the caller drops the frame.
+ */
+static void wait_for_flip_slot(void) {
+    if (!s_use_bgra || !s_vsync)
+        return;
+    uint64_t start = now_us();
+    uint64_t now = start;
+    while (now - start < FLIP_SLOT_WAIT_MAX_US) {
+        MlVideoOutFlipStatus st;
+        if (sceVideoOutGetFlipStatus(s_video, &st) != 0 ||
+            st.numFlipPending < s_flip_queue_max)
+            break;
+        sceKernelUsleep(FLIP_SLOT_POLL_US);
+        now = now_us();
+    }
+    if (now != start) {
+        s_flip_slot_waits++;
+        s_flip_slot_wait_us += (unsigned)(now - start);
+    }
+}
+
+/* Caller holds s_pipe_mtx. */
+static void pipe_finish_locked(void) {
     if (!s_pipe_active || s_pipe_fb_idx < 0)
-        return 0;
+        return;
     bgra_convert_wait();
+    pthread_mutex_lock(&s_bgra_mtx);
+    s_flip_pending = 0;
+    pthread_mutex_unlock(&s_bgra_mtx);
     uint8_t *dst = (uint8_t *)s_fb_cpu[s_pipe_fb_idx];
     int next = s_pipe_fb_idx;
     uint64_t convert_us = s_bgra_job_us;
     s_pipe_active = 0;
     s_pipe_fb_idx = -1;
     present_submit_flip(next, dst, convert_us);
+}
+
+int video_present_bgra_pipe_finish(void) {
+    pthread_mutex_lock(&s_pipe_mtx);
+    pipe_finish_locked();
+    pthread_mutex_unlock(&s_pipe_mtx);
     return 0;
+}
+
+static void *flip_thread_main(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&s_bgra_mtx);
+        while (!s_flip_shutdown && !(s_flip_pending && s_bgra_outstanding == 0))
+            pthread_cond_wait(&s_bgra_cv, &s_bgra_mtx);
+        if (s_flip_shutdown) {
+            pthread_mutex_unlock(&s_bgra_mtx);
+            break;
+        }
+        s_flip_pending = 0;
+        pthread_mutex_unlock(&s_bgra_mtx);
+
+        /* If the decoder got here first and kicked another frame, this waits
+         * for that convert and flips it: still in order, still complete. */
+        (void)video_present_bgra_pipe_finish();
+    }
+    return NULL;
 }
 
 int video_present_bgra_pipe_kick(const uint8_t *y, const uint8_t *uv,
                                  int pitch_y, int pitch_uv, int w, int h) {
     if (s_video < 0 || !y || !s_use_bgra || s_fb_count < 1)
         return -1;
-    if (s_pipe_active)
-        (void)video_present_bgra_pipe_finish();
-    if (video_present_should_drop()) {
+    pthread_mutex_lock(&s_pipe_mtx);
+    pipe_finish_locked();
+    wait_for_flip_slot();
+    if (frame_pacer_should_skip(&s_pacer, now_us()) || video_present_should_drop()) {
+        pthread_mutex_unlock(&s_pipe_mtx);
         video_stats_add(0, 0, 0, 1);
         return 0;
     }
 
     int next = pick_free_fb(NULL);
     if (next < 0) {
+        pthread_mutex_unlock(&s_pipe_mtx);
         video_stats_add(0, 0, 0, 1);
         return 0;
     }
@@ -1322,6 +1382,13 @@ int video_present_bgra_pipe_kick(const uint8_t *y, const uint8_t *uv,
                       y, src_uv, pitch_y, src_uv_pitch, 0);
     s_pipe_fb_idx = next;
     s_pipe_active = 1;
+    if (s_flip_thr_alive) {
+        pthread_mutex_lock(&s_bgra_mtx);
+        s_flip_pending = 1;
+        pthread_cond_broadcast(&s_bgra_cv);
+        pthread_mutex_unlock(&s_bgra_mtx);
+    }
+    pthread_mutex_unlock(&s_pipe_mtx);
     return 0;
 }
 
@@ -1332,7 +1399,7 @@ int video_present_frame(const uint8_t *y, const uint8_t *u, const uint8_t *v,
         return -1;
     if (s_pipe_active)
         (void)video_present_bgra_pipe_finish();
-    if (video_present_should_drop()) {
+    if (frame_pacer_should_skip(&s_pacer, now_us()) || video_present_should_drop()) {
         video_stats_add(0, 0, 0, 1);
         return 0;
     }

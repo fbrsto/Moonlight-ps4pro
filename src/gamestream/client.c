@@ -115,7 +115,8 @@ static int load_serverinfo(gs_server_t *server, bool https) {
     http_resp_t resp;
     int ret = GS_INVALID;
     char *paired = NULL, *currentGame = NULL, *state = NULL, *httpsPort = NULL;
-    char *appversion = NULL, *gfeversion = NULL, *codecMode = NULL;
+    char *appversion = NULL, *gfeversion = NULL, *codecMode = NULL, *hostname = NULL;
+    char *mac = NULL;
 
     uuid_v4(server->id, uuid);
     ret = api_get(server, https, &resp,
@@ -141,6 +142,13 @@ static int load_serverinfo(gs_server_t *server, bool https) {
     xml_search(resp.body, resp.len, "HttpsPort", &httpsPort);
     xml_search(resp.body, resp.len, "GfeVersion", &gfeversion);
     xml_search(resp.body, resp.len, "ServerCodecModeSupport", &codecMode);
+    xml_search(resp.body, resp.len, "hostname", &hostname);
+    if (hostname && hostname[0])
+        snprintf(server->hostname, sizeof(server->hostname), "%s", hostname);
+    /* The host sends zeros on plain HTTP: keep a real MAC once we have one. */
+    xml_search(resp.body, resp.len, "mac", &mac);
+    if (mac && mac[0] && strcmp(mac, "00:00:00:00:00:00") != 0)
+        snprintf(server->mac, sizeof(server->mac), "%s", mac);
 
     server->paired = !strcmp(paired, "1");
     server->currentGame = atoi(currentGame);
@@ -169,8 +177,18 @@ out:
     free(appversion);
     free(gfeversion);
     free(codecMode);
+    free(hostname);
+    free(mac);
     http_resp_free(&resp);
     return ret;
+}
+
+int gs_app_asset(gs_server_t *server, int appId, http_resp_t *resp) {
+    char uuid[37];
+    uuid_v4(server->id, uuid);
+    return api_get(server, 1, resp,
+                   "/appasset?uniqueid=%s&uuid=%s&appid=%d&AssetType=2&AssetIdx=0",
+                   GS_UNIQUEID, uuid, appId);
 }
 
 int gs_init(gs_server_t *server, client_identity_t *id, const char *address,

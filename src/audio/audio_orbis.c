@@ -14,7 +14,12 @@
 // sceAudioOut works with fixed sample grains; 256 is the minimum
 // (5.33 ms at 48 kHz), closest to Moonlight's Opus frame (240, 5 ms).
 #define AUDIO_GRAIN 256
-#define MAX_CHANNELS 2
+#define MAX_CHANNELS 8
+// Surround formats are missing from OpenOrbis' enum (it stops at the mono and
+// stereo ones); these are the values libSceAudioOut takes as param_type.
+// S16_8CH: L R C LFE Ls Rs Lb Rb. S16_8CH_STD: L R C LFE Lb Rb Ls Rs.
+#define ML_AUDIO_OUT_FORMAT_S16_8CH     2u
+#define ML_AUDIO_OUT_FORMAT_S16_8CH_STD 6u
 // Cap on queued PCM before drop: ~32 ms. If output stalls
 // we prefer dropping audio over accumulating latency.
 #define RING_SAMPLES (AUDIO_GRAIN * 6)
@@ -23,7 +28,8 @@
 #define AUDIO_OUT_ALREADY_INIT 0x8026000Eu
 
 static OpusMSDecoder *s_decoder;
-static int s_channels;
+static int s_channels;     // channels decoded by Opus (2, 6 or 8)
+static int s_out_channels; // channels in the sceAudioOut port (1, 2 or 8)
 static int s_samples_per_frame;
 static int32_t s_handle = -1;
 
@@ -81,8 +87,21 @@ static int ar_init(int audioConfiguration, const POPUS_MULTISTREAM_CONFIGURATION
     if (sceUserServiceGetInitialUser(&initial) == 0 && initial > 0)
         user = initial;
 
-    uint32_t fmt = (s_channels == 1) ? ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_MONO
-                                     : ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO;
+    // The port has no 6-channel format: 5.1 goes out as 8CH with silent extras.
+    // Moonlight decodes L R C LFE Bl Br Sl Sr, which is the 8CH_STD order; for
+    // 5.1 the rear pair belongs on the surround slots, which is plain 8CH.
+    uint32_t fmt;
+    if (s_channels == 1) {
+        fmt = ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_MONO;
+        s_out_channels = 1;
+    } else if (s_channels == 2) {
+        fmt = ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO;
+        s_out_channels = 2;
+    } else {
+        fmt = (s_channels == 8) ? ML_AUDIO_OUT_FORMAT_S16_8CH_STD
+                                : ML_AUDIO_OUT_FORMAT_S16_8CH;
+        s_out_channels = 8;
+    }
 
     s_handle = sceAudioOutOpen(user, ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0,
                                AUDIO_GRAIN, rate, fmt);
@@ -133,8 +152,10 @@ static void ring_push(const short *pcm, int samples) {
 }
 
 static void ring_pop(short *out, int samples) {
+    // The port may have more channels than the stream (5.1 in an 8CH port).
+    memset(out, 0, (size_t)samples * (size_t)s_out_channels * sizeof(short));
     for (int i = 0; i < samples; i++) {
-        memcpy(&out[i * s_channels], &s_ring[s_ring_head * s_channels],
+        memcpy(&out[i * s_out_channels], &s_ring[s_ring_head * s_channels],
                (size_t)s_channels * sizeof(short));
         s_ring_head = (s_ring_head + 1) % RING_SAMPLES;
     }

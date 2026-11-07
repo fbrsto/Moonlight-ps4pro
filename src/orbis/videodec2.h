@@ -13,6 +13,7 @@
 #define ORBIS_VIDEODEC2_RESOURCE_TYPE_EMBEDDED 1u
 #define ORBIS_VIDEODEC2_PROFILE_HIGH           100u
 #define ORBIS_VIDEODEC2_LEVEL_51               51u
+#define ORBIS_VIDEODEC2_LEVEL_52               52u
 #define ORBIS_VIDEODEC2_THREAD_PRIO_DEFAULT    700
 #define ORBIS_VIDEODEC2_AFFINITY_ALL           0x3Full
 
@@ -119,7 +120,9 @@ static inline void videodec2_fill_decoder_config_ex(OrbisVideodec2DecoderConfigI
     dc->resourceType = ORBIS_VIDEODEC2_RESOURCE_TYPE_EMBEDDED;
     dc->codecType = ORBIS_VIDEODEC2_CODEC_AVC;
     dc->profile = ORBIS_VIDEODEC2_PROFILE_HIGH;
-    dc->maxLevel = ORBIS_VIDEODEC2_LEVEL_51;
+    /* H.264 level 5.1 stops at 4K30; 4K60 is 5.2. Whether Videodec2 accepts 5.2
+     * is unverified: a refusal shows up as the HW probe failing. */
+    dc->maxLevel = (w * h > 2560 * 1440) ? ORBIS_VIDEODEC2_LEVEL_52 : ORBIS_VIDEODEC2_LEVEL_51;
     dc->maxFrameWidth = w;
     /* 1088: macroblock-align; 1080 in config → slow Decode / rare paths. */
     dc->maxFrameHeight = (h + 15) & ~15;

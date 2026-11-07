@@ -12,6 +12,56 @@
 #include <orbis/libkernel.h>
 #endif
 
+int config_default_bitrate(int width, int height, int fps) {
+    /* Mbps at 30 FPS for reference modes (same reference points as Moonlight). */
+    static const struct { long pixels; int mbps; } k_steps[] = {
+        { 640L * 360L, 1 },
+        { 854L * 480L, 2 },
+        { 1280L * 720L, 5 },
+        { 1920L * 1080L, 10 },
+        { 2560L * 1440L, 20 },
+        { 3840L * 2160L, 40 },
+    };
+    const int n = (int)(sizeof(k_steps) / sizeof(k_steps[0]));
+    long pixels = (long)width * (long)height;
+    double mbps = k_steps[n - 1].mbps;
+
+    if (pixels <= k_steps[0].pixels) {
+        mbps = k_steps[0].mbps;
+    } else {
+        for (int i = 1; i < n; i++) {
+            if (pixels <= k_steps[i].pixels) {
+                double t = (double)(pixels - k_steps[i - 1].pixels) /
+                           (double)(k_steps[i].pixels - k_steps[i - 1].pixels);
+                mbps = k_steps[i - 1].mbps + t * (k_steps[i].mbps - k_steps[i - 1].mbps);
+                break;
+            }
+        }
+    }
+
+    /* The PS4 output tops out at 60 Hz, so higher rates earn no extra budget. */
+    int f = fps < 1 ? 1 : (fps > 60 ? 60 : fps);
+    int kbps = (int)(mbps * 1000.0 * f / 30.0 + 0.5);
+    kbps = ((kbps + 250) / 500) * 500; /* round to the nearest 500 kbps */
+    return kbps < 500 ? 500 : kbps;
+}
+
+static int parse_audio(const char *v) {
+    if (!strcmp(v, "5.1"))
+        return AUDIO_CONFIGURATION_51_SURROUND;
+    if (!strcmp(v, "7.1"))
+        return AUDIO_CONFIGURATION_71_SURROUND;
+    return AUDIO_CONFIGURATION_STEREO;
+}
+
+static const char *audio_name(int audio_configuration) {
+    if (audio_configuration == AUDIO_CONFIGURATION_51_SURROUND)
+        return "5.1";
+    if (audio_configuration == AUDIO_CONFIGURATION_71_SURROUND)
+        return "7.1";
+    return "stereo";
+}
+
 void config_set_defaults(app_config_t *cfg) {
     memset(cfg, 0, sizeof(*cfg));
     LiInitializeStreamConfiguration(&cfg->stream);
@@ -33,9 +83,26 @@ void config_set_defaults(app_config_t *cfg) {
     cfg->local_audio = false;
     cfg->prefer_hw = true;
     cfg->videodec2_spike = false;
-    cfg->prefer_ycbcr = false;
     cfg->enable_file_log = false;
     cfg->show_stats = false;
+    cfg->auto_bitrate = true;
+    cfg->unlock_bitrate = false;
+    cfg->vsync = true;
+    cfg->pad_rumble = true;
+    cfg->pad_motion = true;
+    cfg->pad_touchpad = true;
+    cfg->pad_lightbar = true;
+    cfg->force_hw = false;
+    cfg->quit_app_after = false;
+    cfg->keep_awake = true;
+    cfg->multi_controller = true;
+    cfg->touch_hold_mouse = true;
+    cfg->swap_face_buttons = false;
+    cfg->swap_mouse_buttons = false;
+    cfg->flip_queue_max = 1;
+    cfg->enable_mdns = true;
+    cfg->connection_warnings = true;
+    cfg->config_warnings = true;
     cfg->dec_pipeline_depth = 2;
     cfg->dec_thread_prio = 700;
     cfg->slices_per_frame = 2;
@@ -141,12 +208,54 @@ int config_load(app_config_t *cfg, const char *dir) {
             cfg->prefer_hw = parse_bool(val);
         else if (!strcmp(key, "videodec2_spike"))
             cfg->videodec2_spike = parse_bool(val);
-        else if (!strcmp(key, "prefer_ycbcr"))
-            cfg->prefer_ycbcr = parse_bool(val);
+        else if (!strcmp(key, "prefer_ycbcr") || !strcmp(key, "touchpad_mode"))
+            ; /* removed options: older files still carry them */
         else if (!strcmp(key, "enable_file_log"))
             cfg->enable_file_log = parse_bool(val);
         else if (!strcmp(key, "show_stats"))
             cfg->show_stats = parse_bool(val);
+        else if (!strcmp(key, "audio"))
+            cfg->stream.audioConfiguration = parse_audio(val);
+        else if (!strcmp(key, "auto_bitrate"))
+            cfg->auto_bitrate = parse_bool(val);
+        else if (!strcmp(key, "unlock_bitrate"))
+            cfg->unlock_bitrate = parse_bool(val);
+        else if (!strcmp(key, "vsync"))
+            cfg->vsync = parse_bool(val);
+        else if (!strcmp(key, "frame_pacing"))
+            cfg->frame_pacing = parse_bool(val);
+        else if (!strcmp(key, "force_hw"))
+            cfg->force_hw = parse_bool(val);
+        else if (!strcmp(key, "quit_app_after"))
+            cfg->quit_app_after = parse_bool(val);
+        else if (!strcmp(key, "keep_awake"))
+            cfg->keep_awake = parse_bool(val);
+        else if (!strcmp(key, "multi_controller"))
+            cfg->multi_controller = parse_bool(val);
+        else if (!strcmp(key, "touch_hold_mouse"))
+            cfg->touch_hold_mouse = parse_bool(val);
+        else if (!strcmp(key, "swap_face_buttons"))
+            cfg->swap_face_buttons = parse_bool(val);
+        else if (!strcmp(key, "swap_mouse_buttons"))
+            cfg->swap_mouse_buttons = parse_bool(val);
+        else if (!strcmp(key, "pad_rumble"))
+            cfg->pad_rumble = parse_bool(val);
+        else if (!strcmp(key, "pad_motion"))
+            cfg->pad_motion = parse_bool(val);
+        else if (!strcmp(key, "pad_touchpad"))
+            cfg->pad_touchpad = parse_bool(val);
+        else if (!strcmp(key, "pad_lightbar"))
+            cfg->pad_lightbar = parse_bool(val);
+        else if (!strcmp(key, "host_mac"))
+            snprintf(cfg->host_mac, sizeof(cfg->host_mac), "%s", val);
+        else if (!strcmp(key, "flip_queue_max"))
+            cfg->flip_queue_max = atoi(val);
+        else if (!strcmp(key, "enable_mdns"))
+            cfg->enable_mdns = parse_bool(val);
+        else if (!strcmp(key, "connection_warnings"))
+            cfg->connection_warnings = parse_bool(val);
+        else if (!strcmp(key, "config_warnings"))
+            cfg->config_warnings = parse_bool(val);
         else if (!strcmp(key, "dec_pipeline_depth"))
             cfg->dec_pipeline_depth = atoi(val);
         else if (!strcmp(key, "dec_thread_prio"))
@@ -183,10 +292,10 @@ int config_load(app_config_t *cfg, const char *dir) {
         cfg->dec_au_onion = true;
     }
 
-    LOGI("config: host=%s app=%s debug=%s %dx%d@%d br=%d pkt=%d hw=%d ycbcr=%d file_log=%d",
+    LOGI("config: host=%s app=%s debug=%s %dx%d@%d br=%d pkt=%d hw=%d file_log=%d",
          cfg->host, cfg->app_name, cfg->debug_host,
          cfg->stream.width, cfg->stream.height, cfg->stream.fps, cfg->stream.bitrate,
-         cfg->stream.packetSize, cfg->prefer_hw, cfg->prefer_ycbcr,
+         cfg->stream.packetSize, cfg->prefer_hw,
          cfg->enable_file_log);
     return 0;
 }
@@ -215,7 +324,6 @@ int config_save(const app_config_t *cfg, const char *dir) {
             "local_audio = %s\n"
             "prefer_hw = %s\n"
             "videodec2_spike = %s\n"
-            "prefer_ycbcr = %s\n"
             "enable_file_log = %s\n"
             "show_stats = %s\n"
             "dec_pipeline_depth = %d\n"
@@ -232,13 +340,55 @@ int config_save(const app_config_t *cfg, const char *dir) {
             cfg->local_audio ? "true" : "false",
             cfg->prefer_hw ? "true" : "false",
             cfg->videodec2_spike ? "true" : "false",
-            cfg->prefer_ycbcr ? "true" : "false",
             cfg->enable_file_log ? "true" : "false",
             cfg->show_stats ? "true" : "false",
             cfg->dec_pipeline_depth, cfg->dec_thread_prio, cfg->slices_per_frame,
             cfg->dec_au_onion ? "true" : "false",
             cfg->dec_fb_garlic ? "true" : "false",
             cfg->bgra_workers, cfg->bgra_nt);
+    fprintf(f,
+            "audio = %s\n"
+            "auto_bitrate = %s\n"
+            "unlock_bitrate = %s\n"
+            "vsync = %s\n"
+            "frame_pacing = %s\n"
+            "force_hw = %s\n"
+            "quit_app_after = %s\n"
+            "keep_awake = %s\n"
+            "multi_controller = %s\n"
+            "touch_hold_mouse = %s\n"
+            "swap_face_buttons = %s\n"
+            "swap_mouse_buttons = %s\n"
+            "pad_rumble = %s\n"
+            "pad_motion = %s\n"
+            "pad_touchpad = %s\n"
+            "pad_lightbar = %s\n"
+            "host_mac = %s\n"
+            "flip_queue_max = %d\n"
+            "enable_mdns = %s\n"
+            "connection_warnings = %s\n"
+            "config_warnings = %s\n",
+            audio_name(cfg->stream.audioConfiguration),
+            cfg->auto_bitrate ? "true" : "false",
+            cfg->unlock_bitrate ? "true" : "false",
+            cfg->vsync ? "true" : "false",
+            cfg->frame_pacing ? "true" : "false",
+            cfg->force_hw ? "true" : "false",
+            cfg->quit_app_after ? "true" : "false",
+            cfg->keep_awake ? "true" : "false",
+            cfg->multi_controller ? "true" : "false",
+            cfg->touch_hold_mouse ? "true" : "false",
+            cfg->swap_face_buttons ? "true" : "false",
+            cfg->swap_mouse_buttons ? "true" : "false",
+            cfg->pad_rumble ? "true" : "false",
+            cfg->pad_motion ? "true" : "false",
+            cfg->pad_touchpad ? "true" : "false",
+            cfg->pad_lightbar ? "true" : "false",
+            cfg->host_mac,
+            cfg->flip_queue_max,
+            cfg->enable_mdns ? "true" : "false",
+            cfg->connection_warnings ? "true" : "false",
+            cfg->config_warnings ? "true" : "false");
     fclose(f);
     return 0;
 }

@@ -3,6 +3,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 
 // ---------------------------------------------------------------------------
@@ -264,6 +265,27 @@ int xml_applist(const char *data, size_t len, app_entry_t **list) {
 oom:
     xml_applist_free(head);
     return GS_OUT_OF_MEMORY;
+}
+
+static int all_digits(const char *s) {
+    if (!*s)
+        return 0;
+    for (; *s; s++)
+        if (*s < '0' || *s > '9')
+            return 0;
+    return 1;
+}
+
+int xml_applist_resolve(const app_entry_t *list, const char *app) {
+    /* The name comes first: titles can start with digits ("007 - First Light")
+     * or be nothing but digits. */
+    for (const app_entry_t *a = list; a; a = a->next) {
+        if (a->name && !strcasecmp(a->name, app))
+            return a->id;
+    }
+    if (all_digits(app))
+        return atoi(app);
+    return list ? list->id : 0;
 }
 
 void xml_applist_free(app_entry_t *list) {

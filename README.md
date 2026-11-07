@@ -6,7 +6,7 @@ game-streaming client) for jailbroken PS4 (GoldHEN), built on the
 
 Full port plan: [PLAN.md](PLAN.md).
 
-**Current version: 1.1.0**
+**Current version: 1.3.13**
 
 ## Status
 
@@ -16,15 +16,31 @@ Playable client for jailbroken PS4 (GoldHEN / FW 9.00 validated):
 - [x] Audio (Opus + `sceAudioOut`)
 - [x] Software video (FFmpeg) and hardware decode (`libSceVideodec2`, `prefer_hw`)
 - [x] DualShock 4 input (`scePad`)
-- [x] On-console UI (APPS / SETTINGS + on-screen keyboard) and INI config
+- [x] On-console UI (PCs / app grid / Settings + on-screen keyboard) and INI config
 - [x] Installable `.pkg` (`CATEGORY=gd`)
 - [x] Optional performance overlay and Videodec2 / BGRA tuning knobs
 
 ### TODO
 
 - [ ] Keyboard and mouse support
-- [ ] mDNS host discovery
 - [ ] Native YCbCr/NV12 presentation on `sceVideoOut`
+- [ ] Before a public release: find a fix for the controller lost after the host wakes from sleep (see Known issues)
+
+### Known issues
+
+- **No rumble with Vibepollo's Automatic gamepad type (seen on 2.0.6):** Automatic presents a
+  DualSense, and rumble did not reach the console in The Witcher 3. Set `Emulated Gamepad Type` to
+  the DualShock 4 option of the Vibepollo Virtual Gamepad. Steam may then warn about the controller
+  and show Xbox buttons in some games: The Witcher 3 did, 007 First Light kept PlayStation buttons.
+
+- **No controller in games after the host PC wakes from sleep (Vibepollo 2.0.6):** the host's
+  virtual gamepad driver can fail after a wake, and its log shows `VHF keyboard/mouse stopped
+  after driver error [00000651]`, then `VHF controller allocation deferred while recovering a
+  removed device`. Reconnecting does not help: the host still refused the controller 4 minutes
+  later. Reading Vibepollo's source, its recovery thread sleeps until a controller exists, while
+  controllers are refused until recovery ends. Restarting Vibepollo brings the controller back.
+  Its issue is [Nonary/Vibepollo#462](https://github.com/Nonary/Vibepollo/issues/462).
+  `keyboard_mouse_backend = sendinput` on the host may avoid this; it is untested.
 
 Full port plan and longer backlog: [PLAN.md](PLAN.md). Validation notes: [docs/CONSOLE_VALIDATE.md](docs/CONSOLE_VALIDATE.md).
 
@@ -75,7 +91,7 @@ scripts/build_pkg.sh
 cmake -B build-host -G Ninja && cmake --build build-host
 ```
 
-Installable artifact: `build-ps4/Moonlight-1.1.0.pkg`
+Installable artifact: `build-ps4/Moonlight-1.3.13.pkg`
 (also `IV0000-MLNT00001_00-MOONLIGHTPS40000.pkg`).
 
 `build_pkg.sh` runs `source scripts/env.sh` itself. Manual CMake equivalent:
@@ -90,22 +106,17 @@ cmake --build build-ps4
 
 1. Install the `.pkg` (Package Installer / GoldHEN / FTP). The package uses
   `CATEGORY=gd` (required so GoldHEN injects plugins).
-2. Optional — YCbCr presentation (`prefer_ycbcr=true`, experimental):
-  - Copy `plugin/bin/ycbcr_unlock.prx` → `/data/GoldHEN/plugins/`
-  - Add `[MLNT00001]` in `/data/GoldHEN/plugins.ini`
-  (see `[plugin/README.md](plugin/README.md)` and `plugin/plugins.ini.example`)
-  - GoldHEN → Enable plugins
-  - After each reboot, send the kpayload once:
-  `nc -w 3 <PS4_IP> 9090 < plugin/bin/ycbcr_kpatch_900.bin`
-3. On first launch the app opens the **SETTINGS** menu if no host is set. You can
+2. On first launch choose **Add PC** and enter the PC's address. You can
   also create `/data/moonlight/moonlight.ini` over FTP (see
    `pkg/assets/misc/moonlight.ini`). Optional: `debug_host.txt` with your PC IP.
-4. Start Sunshine on the PC. On first pair the app shows a PIN (also written to
+3. Start Sunshine on the PC. On first pair the app shows a PIN (also written to
   `/data/moonlight/pin.txt`); enter it at `https://<pc>:47990/pin`.
-5. Logs on the PC: `nc -ulk 9999` (or enable file log in SETTINGS →
+4. Logs on the PC: `nc -ulk 9999` (or enable file log in Settings →
   `/data/moonlight/debug.log`).
-6. In the menu: **X/O** start app, **L1/R1** switch APPS/SETTINGS,
-  **OPTIONS** quit active Sunshine session, **OPTIONS + Touchpad** (~1 s) exit stream.
+5. In the menu: **X** select or start, **O** back, **R1** Settings, **L1** Add PC,
+  **Triangle** refresh, **OPTIONS** context menu. In a stream: **OPTIONS + Touchpad** (~1 s) opens a menu (stats, frame pacing, bitrate, disconnect, quit game);
+  a finger on the touchpad makes the right stick move the mouse, with **R2** and **L2** as clicks.
+  A dropped connection reconnects by itself (5 attempts); **O** goes back to the menu.
 
 
 
@@ -117,9 +128,24 @@ cmake --build build-ps4
 | Resolution / FPS | 1920×1080 @ 60                                                 |
 | Bitrate          | 20 Mbps, H.264                                                 |
 | `prefer_hw`      | `true` (Videodec2)                                             |
-| `prefer_ycbcr`   | `false` (BGRA path; correct colors, SSE2 multi-thread convert) |
 | Title ID         | `MLNT00001`                                                    |
 
+
+### Settings shared with the official client
+
+The menu follows the official client's pages, sizes and Material dark theme (Computers,
+app grid with box art, two-column Settings) and finds PCs by mDNS (`_nvstream._tcp`).
+Settings: resolution (540p to 1080p; 1440p and 4K are experimental, decoded and scaled
+down to the 1080p output), FPS (30, 60 or a custom value from 10 to 60),
+bitrate (default per mode, up to 150 Mbps, or 500 Mbps unlocked), V-Sync, frame pacing, stereo/5.1/7.1
+audio, mute host speakers, swap face/mouse buttons, one gamepad per
+logged-in PS4 user, touchpad as mouse, rumble, motion controls, touchpad touches, light bar, optimize
+game settings, quit app after stream, keep console awake, video decoder, performance
+stats, and connection/configuration warnings.
+
+`src/ui/ui_assets.{c,h}` are generated from `assets-src/` (Roboto, Apache 2.0; icons from
+moonlight-qt, GPLv3) by `scripts/bake_ui_assets/bake.ps1`, which needs Windows.
+`third_party/stb/stb_image.h` decodes box art.
 
 Mean decode/convert/present times are printed every second over UDP.
 Validation protocol: `[docs/CONSOLE_VALIDATE.md](docs/CONSOLE_VALIDATE.md)`.

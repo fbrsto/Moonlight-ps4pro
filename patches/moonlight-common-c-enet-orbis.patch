@@ -1,5 +1,5 @@
 diff --git a/unix.c b/unix.c
-index 5ad7ca9..0a47dac 100644
+index 5ad7ca9..84ea789 100644
 --- a/unix.c
 +++ b/unix.c
 @@ -204,6 +204,29 @@ typedef int socklen_t;
@@ -98,7 +98,66 @@ index 5ad7ca9..0a47dac 100644
              struct in6_pktinfo pktInfo;
  
              pktInfo.ipi6_addr = ((struct sockaddr_in6*)&localAddress->address)->sin6_addr;
-@@ -864,7 +887,7 @@ enet_socket_receive (ENetSocket socket,
+@@ -743,6 +766,8 @@ enet_socket_send (ENetSocket socket,
+         // socket timeout to kill us if the connection
+         // is permanently interrupted.
+         case EADDRNOTAVAIL:
++        case ENOBUFS:
++        case ENOMEM:
+         case ENETDOWN:
+         case ENETUNREACH:
+ #if !defined(EHOSTDOWN) || (EHOSTDOWN != EHOSTUNREACH)
+@@ -777,10 +802,22 @@ enet_socket_receive (ENetSocket socket,
+ 
+     if (recvLength == -1)
+     {
+-       if (errno == EWOULDBLOCK)
++       switch (errno)
++       {
++       case EWOULDBLOCK:
++       case EINTR:
++       case ENOBUFS:
++       case ENOMEM:
++       case ECONNREFUSED:
++       case ECONNRESET:
++       case ENETDOWN:
++       case ENETUNREACH:
++       case EHOSTUNREACH:
+          return 0;
+ 
+-       return -1;
++       default:
++         return -1;
++       }
+     }
+ 
+     return recvLength;
+@@ -805,10 +842,22 @@ enet_socket_receive (ENetSocket socket,
+ 
+     if (recvLength == -1)
+     {
+-       if (errno == EWOULDBLOCK)
++       switch (errno)
++       {
++       case EWOULDBLOCK:
++       case EINTR:
++       case ENOBUFS:
++       case ENOMEM:
++       case ECONNREFUSED:
++       case ECONNRESET:
++       case ENETDOWN:
++       case ENETUNREACH:
++       case EHOSTUNREACH:
+          return 0;
+ 
+-       return -1;
++       default:
++         return -1;
++       }
+     }
+ 
+ #ifdef HAS_MSGHDR_FLAGS
+@@ -864,7 +913,7 @@ enet_socket_receive (ENetSocket socket,
          // instead of AF_INET6 addresses then rejects those same addresses when they are passed to sendmsg().
          // Strangely, this only happens when the socket is bound, and IPV6_PKTINFO properly returns v4-mapped
          // addresses in the same call. This is probably a kernel bug, so we fix it up here.

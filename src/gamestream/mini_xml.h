@@ -20,3 +20,7 @@ int xml_search(const char *data, size_t len, const char *node, char **result);
 // Extract the <App><ID/><AppTitle/></App> list. Free with xml_applist_free.
 int xml_applist(const char *data, size_t len, app_entry_t **list);
 void xml_applist_free(app_entry_t *list);
+
+// App id for a configured app: exact name (ignoring case), else an all-digit
+// value taken as an id, else the first app. 0 when there is nothing to pick.
+int xml_applist_resolve(const app_entry_t *list, const char *app);

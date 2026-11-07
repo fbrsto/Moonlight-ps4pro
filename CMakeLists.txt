@@ -69,7 +69,9 @@ if(PS4)
     add_executable(moonlight-ps4.elf
         src/main.c
         src/stream.c
+        src/ui/stream_menu.c
         src/ports/ps4_entropy.c
+        src/orbis/mem_stats.c
         src/orbis/net_orbis.c
         src/orbis/videodec2_loader.c
         src/audio/audio_orbis.c
@@ -80,6 +82,10 @@ if(PS4)
         src/video/decoder_orbis.c
         src/input/input_pad.c
         src/ui/ui_draw.c
+        src/gamestream/mdns.c
+        src/gamestream/wol.c
+        src/ui/ui_assets.c
+        src/ui/ui_boxart.c
         src/ui/ui_menu.c
         ${COMMON_SOURCES}
         ${GAMESTREAM_SOURCES}
@@ -88,7 +94,12 @@ if(PS4)
         src
         ${FFMPEG_PS4_PREFIX}/include
         third_party/h264bitstream
+        third_party/stb
     )
+    # Heap replacement and accounting: see src/orbis/mem_stats.h.
+    set_target_properties(moonlight-ps4.elf PROPERTIES
+        LINK_FLAGS "--wrap=malloc --wrap=calloc --wrap=realloc --wrap=free --wrap=memalign --wrap=aligned_alloc --wrap=posix_memalign")
+
     target_link_libraries(moonlight-ps4.elf PRIVATE
         moonlight-common-c
         enet

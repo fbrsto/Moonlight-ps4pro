@@ -800,8 +800,9 @@ void video_orbis_set_tuning(int pipeline_depth, int thread_prio,
                             int au_onion, int fb_garlic) {
     if (pipeline_depth < 1)
         pipeline_depth = 1;
-    if (pipeline_depth > ORBIS_VIDEODEC2_MAX_PIPELINE_DEPTH - 1)
-        pipeline_depth = ORBIS_VIDEODEC2_MAX_PIPELINE_DEPTH - 1;
+    /* The renderer relies on fb_n = depth + 2, and fb_n stops at VD2_MAX_FB. */
+    if (pipeline_depth > VD2_MAX_FB - 2)
+        pipeline_depth = VD2_MAX_FB - 2;
     s_tune_depth = pipeline_depth;
     s_tune_prio = thread_prio > 0 ? thread_prio : ORBIS_VIDEODEC2_THREAD_PRIO_DEFAULT;
     s_tune_au_onion = au_onion ? 1 : 0;
