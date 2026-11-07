@@ -25,8 +25,6 @@ Work in this order:
 Per-game settings were dropped: the in-stream menu already changes bitrate and pacing, and one set of
 settings suits most games on the Pro. Rumble strength was dropped too: many games have their own setting.
 
-Before the public release: redesign the whole interface.
-
 Later: real 4K output, direct YCbCr output, HDR, USB keyboard and mouse, French UI, favourites,
 direct launch after Wake PC, and public release work (install guide, CI builds, license review).
 

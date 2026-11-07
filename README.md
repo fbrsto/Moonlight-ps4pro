@@ -4,6 +4,9 @@ Unofficial [Moonlight](https://moonlight-stream.org/) port (Sunshine/GameStream
 game-streaming client) for jailbroken PS4 (GoldHEN), built on the
 [OpenOrbis](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain) toolchain.
 
+Fork of [JaimeJimenezG/Moonlight-ps4](https://github.com/JaimeJimenezG/Moonlight-ps4), focused on
+the PS4 Pro: rumble, motion, reconnect, in-stream menu, steadier frames, stable memory.
+
 Full port plan: [PLAN.md](PLAN.md).
 
 **Current version: 1.3.13**
@@ -24,7 +27,6 @@ Playable client for jailbroken PS4 (GoldHEN / FW 9.00 validated):
 
 - [ ] Keyboard and mouse support
 - [ ] Native YCbCr/NV12 presentation on `sceVideoOut`
-- [ ] Before a public release: find a fix for the controller lost after the host wakes from sleep (see Known issues)
 
 ### Known issues
 
