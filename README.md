@@ -7,6 +7,8 @@ game-streaming client) for jailbroken PS4 (GoldHEN), built on the
 Fork of [JaimeJimenezG/Moonlight-ps4](https://github.com/JaimeJimenezG/Moonlight-ps4), focused on
 the PS4 Pro: rumble, motion, reconnect, in-stream menu, steadier frames, stable memory.
 
+**Tested on PS4 Pro with GoldHEN 13.52, over Ethernet.**
+
 Full port plan: [PLAN.md](PLAN.md).
 
 **Current version: 1.3.13**
